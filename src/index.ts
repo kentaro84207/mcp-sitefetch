@@ -48,7 +48,7 @@ const getFilePath = (url: string): string => {
 };
 
 // Load metadata
-async function loadMetadata(): Promise<Record<string, { url: string, fetchedAt: string }>> {
+async function loadMetadata(): Promise<Record<string, { url: string, fetchedAt: string, title?: string }>> {
   try {
     const data = await fs.readFile(METADATA_FILE, "utf-8");
     return JSON.parse(data);
@@ -59,8 +59,17 @@ async function loadMetadata(): Promise<Record<string, { url: string, fetchedAt: 
 }
 
 // Save metadata
-async function saveMetadata(metadata: Record<string, { url: string, fetchedAt: string }>): Promise<void> {
+async function saveMetadata(metadata: Record<string, { url: string, fetchedAt: string, title?: string }>): Promise<void> {
   await fs.writeFile(METADATA_FILE, JSON.stringify(metadata, null, 2), "utf-8");
+}
+
+// Extract title from content
+function extractTitle(content: string): string {
+  const titleMatch = content.match(/<title>(.*?)<\/title>/i);
+  if (titleMatch && titleMatch[1]) {
+    return titleMatch[1].trim();
+  }
+  return "No title found";
 }
 
 // Fetch site information
@@ -92,10 +101,14 @@ async function fetchSite(url: string, forceRefresh = false): Promise<string> {
     // Read the result
     const content = await fs.readFile(filePath, "utf-8");
 
+    // Extract title
+    const title = extractTitle(content);
+
     // Update metadata
     metadata[fileHash] = {
       url: url,
-      fetchedAt: new Date().toISOString()
+      fetchedAt: new Date().toISOString(),
+      title: title
     };
 
     await saveMetadata(metadata);
@@ -111,28 +124,84 @@ async function fetchSite(url: string, forceRefresh = false): Promise<string> {
 const server = new McpServer({
   name: "SiteFetch MCP Server",
   version: "1.0.0"
+}, {
+  // Enable context capability
+  capabilities: {
+    context: {}
+  }
 });
 
-// Add site fetch tool
+// Helper to add content to context
+async function addToContext(url: string, content: string, extra: any) {
+  try {
+    const encodedUrl = encodeURIComponent(url);
+    const resourceUri = `sitefetch://${encodedUrl}`;
+
+    // Send a context/add notification to the client
+    if (extra.sendNotification) {
+      await extra.sendNotification({
+        method: "notifications/context/add",
+        params: {
+          resources: [{
+            uri: resourceUri,
+            title: `Web content: ${url}`,
+            type: "text/plain"
+          }]
+        }
+      });
+
+      console.error(`Added ${url} to context with URI: ${resourceUri}`);
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error("Failed to add to context:", error);
+    return false;
+  }
+}
+
+// Add enhanced site fetch tool
 server.tool(
   "fetch-site",
+  "Fetch a website and optionally add it to context",
   {
     url: z.string().url(),
-    forceRefresh: z.boolean().optional()
+    forceRefresh: z.boolean().optional(),
+    addToContext: z.boolean().optional()
   },
-  async ({ url, forceRefresh = false }) => {
+  async ({ url, forceRefresh = false, addToContext: shouldAddToContext = true }, extra) => {
     try {
       const content = await fetchSite(url, forceRefresh);
       const encodedUrl = encodeURIComponent(url);
+      const resourceUri = `sitefetch://${encodedUrl}`;
+
+      let responseText = `Successfully fetched site content from ${url}.\n\n`;
+      let addedToContext = false;
+
+      if (shouldAddToContext) {
+        // Try to add to context
+        addedToContext = await addToContext(url, content, extra);
+
+        if (addedToContext) {
+          responseText += `Content added to your context. You can refer to information from this site in your queries.\n\n`;
+        } else {
+          responseText += `Failed to add content to context automatically.\n`;
+        }
+      }
+
+      responseText += `Resource URI: ${resourceUri}\n` +
+                     `Content length: ${content.length} characters\n` +
+                     `Stored at: ${getFilePath(url)}\n\n`;
+
+      if (!addedToContext) {
+        responseText += `To add this content to your context, use the add-to-context tool with this URL.`;
+      }
 
       return {
         content: [
           {
             type: "text",
-            text: `Successfully fetched site content from ${url}.\n\n` +
-                 `The content is available as a resource at sitefetch://${encodedUrl}\n\n` +
-                 `Content length: ${content.length} characters\n` +
-                 `Stored at: ${getFilePath(url)}`
+            text: responseText
           }
         ]
       };
@@ -146,11 +215,87 @@ server.tool(
   }
 );
 
-// Provide site content as a resource
+// Add dedicated tool to add fetched content to context
+server.tool(
+  "add-to-context",
+  "Add previously fetched site to the conversation context",
+  {
+    url: z.string().url()
+  },
+  async ({ url }, extra) => {
+    try {
+      const filePath = getFilePath(url);
+
+      // Check if file exists
+      try {
+        await fs.access(filePath);
+      } catch {
+        return {
+          content: [{
+            type: "text",
+            text: `Error: Content for ${url} not found. Please fetch it first with fetch-site.`
+          }],
+          isError: true
+        };
+      }
+
+      const content = await fs.readFile(filePath, "utf-8");
+      const addedToContext = await addToContext(url, content, extra);
+
+      if (addedToContext) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Added content from ${url} to your context.\n` +
+                   `Content length: ${content.length} characters\n` +
+                   `You can now reference this information in your conversation.`
+            }
+          ]
+        };
+      } else {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Failed to add content to context. This may be due to client limitations.\n` +
+                   `The content is available at resource URI: sitefetch://${encodeURIComponent(url)}`
+            }
+          ],
+          isError: true
+        };
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text", text: `Error: ${errorMessage}` }],
+        isError: true
+      };
+    }
+  }
+);
+
+// Provide site content as a resource with improved listing
 server.resource(
   "site-content",
-  new ResourceTemplate("sitefetch://{url}", { list: undefined }),
-  async (uri, { url }) => {
+  new ResourceTemplate("sitefetch://{url}", {
+    list: async (extra) => {
+      // List all available fetched sites
+      const metadata = await loadMetadata();
+      return {
+        resources: Object.entries(metadata).map(([hash, data]) => ({
+          name: data.title || data.url,
+          uri: `sitefetch://${encodeURIComponent(data.url)}`,
+          description: `Fetched: ${data.fetchedAt}`
+        }))
+      };
+    }
+  }),
+  {
+    description: "Fetched website content",
+    mimeType: "text/plain"
+  },
+  async (uri, { url }, extra) => {
     try {
       // Handle array or string values appropriately
       const urlValue = Array.isArray(url) ? url[0] : url;
@@ -158,10 +303,13 @@ server.resource(
 
       const content = await fetchSite(decodedUrl);
 
+      // Add a hint for adding to context
+      const contextHint = `\n\n---\nTo add this content to your conversation context, use: add-to-context ${decodedUrl}`;
+
       return {
         contents: [{
           uri: uri.href,
-          text: content,
+          text: content + contextHint,
           mimeType: "text/plain"
         }]
       };
@@ -172,9 +320,106 @@ server.resource(
   }
 );
 
-// Tool to display site list
+// Provide direct access to the site-content-info resource
+server.resource(
+  "site-content-info",
+  "sitefetch://info",
+  {
+    description: "Information about available site content",
+    mimeType: "text/plain"
+  },
+  async (uri) => {
+    try {
+      const metadata = await loadMetadata();
+      const entries = Object.entries(metadata);
+
+      if (entries.length === 0) {
+        return {
+          contents: [{
+            uri: uri.href,
+            text: "No sites have been fetched yet. Use fetch-site to retrieve website content.",
+            mimeType: "text/plain"
+          }]
+        };
+      }
+
+      const siteInfoList = entries.map(([hash, data]) => {
+        const { url, fetchedAt, title } = data;
+        const encodedUrl = encodeURIComponent(url);
+        return `- ${title || url}\n  URL: ${url}\n  Resource: sitefetch://${encodedUrl}\n  Fetched: ${fetchedAt}`;
+      }).join('\n\n');
+
+      return {
+        contents: [{
+          uri: uri.href,
+          text: `Available fetched sites:\n\n${siteInfoList}\n\nTo add any of these to your context, use: add-to-context <url>`,
+          mimeType: "text/plain"
+        }]
+      };
+    } catch (error) {
+      return {
+        contents: [{
+          uri: uri.href,
+          text: `Error listing sites: ${error}`,
+          mimeType: "text/plain"
+        }]
+      };
+    }
+  }
+);
+
+// Enhanced resource to list available sites
+server.resource(
+  "available-sites",
+  "sitefetch://list",
+  {
+    description: "List of all fetched websites",
+    mimeType: "text/plain"
+  },
+  async (uri) => {
+    try {
+      const metadata = await loadMetadata();
+      const entries = Object.entries(metadata);
+
+      if (entries.length === 0) {
+        return {
+          contents: [{
+            uri: uri.href,
+            text: "No sites have been fetched yet. Use fetch-site to retrieve website content.",
+            mimeType: "text/plain"
+          }]
+        };
+      }
+
+      const siteList = entries.map(([hash, data]) => {
+        const { url, fetchedAt, title } = data;
+        const encodedUrl = encodeURIComponent(url);
+        return `${title || url} (fetched: ${fetchedAt})\n   Resource: sitefetch://${encodedUrl}\n   URL: ${url}`;
+      }).join('\n\n');
+
+      return {
+        contents: [{
+          uri: uri.href,
+          text: `Available fetched sites:\n\n${siteList}`,
+          mimeType: "text/plain"
+        }]
+      };
+    } catch (error) {
+      return {
+        contents: [{
+          uri: uri.href,
+          text: `Error listing sites: ${error}`,
+          mimeType: "text/plain"
+        }]
+      };
+    }
+  }
+);
+
+// Enhanced tool to display site list with more metadata
 server.tool(
   "list-sites",
+  "List all fetched websites",
   {},
   async () => {
     try {
@@ -183,22 +428,23 @@ server.tool(
 
       if (entries.length === 0) {
         return {
-          content: [{ type: "text", text: "No sites have been fetched yet." }]
+          content: [{ type: "text", text: "No sites have been fetched yet. Use fetch-site to retrieve website content." }]
         };
       }
 
       const siteList = entries.map(([hash, data], index) => {
-        const { url, fetchedAt } = data;
+        const { url, fetchedAt, title } = data;
         const filePath = getFilePath(url);
         const encodedUrl = encodeURIComponent(url);
+        const fileSize = fs.stat(filePath).then(stat => stat.size).catch(() => "unknown");
 
-        return `${index + 1}. ${url}\n   Resource: sitefetch://${encodedUrl}\n   Fetched: ${fetchedAt}\n   File: ${filePath}`;
+        return `${index + 1}. ${title || url}\n   URL: ${url}\n   Resource: sitefetch://${encodedUrl}\n   Fetched: ${fetchedAt}\n   File: ${filePath}`;
       });
 
       return {
         content: [{
           type: "text",
-          text: `Fetched sites:\n\n${siteList.join('\n\n')}`
+          text: `Fetched sites:\n\n${(await Promise.all(siteList)).join('\n\n')}\n\nTo add any of these to your context, use: add-to-context <url>`
         }]
       };
     } catch (error) {
@@ -214,6 +460,7 @@ server.tool(
 // Cache clear tool
 server.tool(
   "clear-cache",
+  "Clear all cached website content",
   {},
   async () => {
     try {
