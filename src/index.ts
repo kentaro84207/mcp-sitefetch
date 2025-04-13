@@ -137,26 +137,39 @@ async function addToContext(url: string, content: string, extra: any) {
     const encodedUrl = encodeURIComponent(url);
     const resourceUri = `sitefetch://${encodedUrl}`;
 
-    // Send a context/add notification to the client
+    // First method: Using notification (might not work in all clients)
+    let success = false;
     if (extra.sendNotification) {
-      await extra.sendNotification({
-        method: "notifications/context/add",
-        params: {
-          resources: [{
-            uri: resourceUri,
-            title: `Web content: ${url}`,
-            type: "text/plain"
-          }]
-        }
-      });
-
-      console.error(`Added ${url} to context with URI: ${resourceUri}`);
-      return true;
+      try {
+        await extra.sendNotification({
+          method: "notifications/context/add",
+          params: {
+            resources: [{
+              uri: resourceUri,
+              title: `Web content: ${url}`,
+              type: "text/plain"
+            }]
+          }
+        });
+        success = true;
+        console.error(`Added ${url} to context with URI: ${resourceUri}`);
+      } catch (err) {
+        console.error("Failed to add to context via notification:", err);
+      }
     }
-    return false;
+
+    // Return content directly as an alternative approach
+    return {
+      success,
+      resourceUri,
+      content: content
+    };
   } catch (error) {
     console.error("Failed to add to context:", error);
-    return false;
+    return {
+      success: false,
+      error: String(error)
+    };
   }
 }
 
@@ -176,13 +189,13 @@ server.tool(
       const resourceUri = `sitefetch://${encodedUrl}`;
 
       let responseText = `Successfully fetched site content from ${url}.\n\n`;
-      let addedToContext = false;
+      let contextResult = { success: false };
 
       if (shouldAddToContext) {
         // Try to add to context
-        addedToContext = await addToContext(url, content, extra);
+        contextResult = await addToContext(url, content, extra);
 
-        if (addedToContext) {
+        if (contextResult.success) {
           responseText += `Content added to your context. You can refer to information from this site in your queries.\n\n`;
         } else {
           responseText += `Failed to add content to context automatically.\n`;
@@ -193,15 +206,24 @@ server.tool(
                      `Content length: ${content.length} characters\n` +
                      `Stored at: ${getFilePath(url)}\n\n`;
 
-      if (!addedToContext) {
+      if (!contextResult.success) {
         responseText += `To add this content to your context, use the add-to-context tool with this URL.`;
       }
+
+      // Include a snippet of the content in the response
+      const contentPreview = content.length > 500
+        ? content.substring(0, 500) + "..."
+        : content;
 
       return {
         content: [
           {
             type: "text",
             text: responseText
+          },
+          {
+            type: "text",
+            text: `Content preview:\n\n${contentPreview}`
           }
         ]
       };
@@ -240,9 +262,9 @@ server.tool(
       }
 
       const content = await fs.readFile(filePath, "utf-8");
-      const addedToContext = await addToContext(url, content, extra);
+      const contextResult = await addToContext(url, content, extra);
 
-      if (addedToContext) {
+      if (contextResult.success) {
         return {
           content: [
             {
@@ -254,15 +276,22 @@ server.tool(
           ]
         };
       } else {
+        // Alternative approach: Return the content directly
+        const contentPreview = content.length > 2000
+          ? content.substring(0, 2000) + "...\n[Content truncated for readability]"
+          : content;
+
         return {
           content: [
             {
               type: "text",
-              text: `Failed to add content to context. This may be due to client limitations.\n` +
-                   `The content is available at resource URI: sitefetch://${encodeURIComponent(url)}`
+              text: `I wasn't able to add the content to context through the system mechanism, but I've retrieved the content directly:\n\n` +
+                   `URL: ${url}\n` +
+                   `Length: ${content.length} characters\n` +
+                   `Resource URI: sitefetch://${encodeURIComponent(url)}\n\n` +
+                   `Content:\n\n${contentPreview}`
             }
-          ],
-          isError: true
+          ]
         };
       }
     } catch (error) {
